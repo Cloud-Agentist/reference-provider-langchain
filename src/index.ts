@@ -2,9 +2,10 @@
  * reference-provider-langchain
  * -----------------------------
  * Reference cognition provider using LangChain.js + OpenAI.
- * Implements POST /reasoning (ReasoningRequest → ReasoningResult) so it can
- * be registered in the cognition-provider-registry and run against the
- * reasoning-gym alongside other providers.
+ * Accepts PerceptionFrame-based requests with time-sliced multimodal sensory data.
+ * Returns motor commands (move, speak, gesture, act) via OpenAI function calling.
+ *
+ * This is a REQUEST-RESPONSE provider — the platform calls it on a heartbeat.
  *
  * Port: 8081 (default)
  *
@@ -12,18 +13,6 @@
  *   OPENAI_API_KEY  — required
  *   OPENAI_MODEL    — model name (default gpt-4o-mini)
  *   PORT            — override listen port
- *
- * Context enrichment (mirrors reference-provider claude mode):
- *   - actorContext.displayName     → injected into system prompt
- *   - actorContext.activeGoals     → injected as bullet list
- *   - actorContext.metadata.memories → recent memories injected
- *   - actorContext.metadata.world  → world facts injected
- *
- * Intent proposal:
- *   Detects sensitive-action keywords in the input and proposes a structured
- *   intent in proposedIntents[]. This mirrors the stub provider behaviour so
- *   the reasoning-gym can exercise governance flows regardless of which
- *   provider is active.
  */
 
 import Fastify from "fastify";
@@ -40,184 +29,302 @@ if (!process.env.OPENAI_API_KEY) {
 
 const app = Fastify({ logger: true });
 
-// ── Types (aligned with agent-provider-contracts schemas) ─────────────────────
+// ── Types ────────────────────────────────────────────────────────────────────
 
-interface ActorContextMeta {
-  memories?: Array<{ content?: { text?: string }; memory_type?: string; [k: string]: unknown }>;
-  world?: Record<string, unknown>;
-  [k: string]: unknown;
+interface SensoryChannel {
+  facultyId: string;
+  modality: string;
+  payload: { format: string; data: string };
+  sources?: Array<{ sourceId: string; distance: number; bearing: number }>;
 }
 
-interface ActorContext {
-  actorId?: string;
-  actorType?: string;
-  displayName?: string;
-  activeGoals?: string[];
-  sessionId?: string;
-  metadata?: ActorContextMeta;
-}
-
-interface ReasoningRequest {
+interface SensorySlice {
+  sliceId: string;
   actorId: string;
-  input: string;
-  mode?: "ask" | "plan" | "reflect";
+  capturedAt: string;
+  durationMs: number;
+  channels: SensoryChannel[];
+}
+
+interface PerceptionFrame {
+  frameId: string;
+  actorId: string;
+  capturedAt: string;
+  slices: SensorySlice[];
+  memoryContext?: unknown[];
+  selfState?: {
+    status?: string;
+    currentGoals?: string[];
+    pendingActions?: string[];
+    faculties?: string[];
+  };
+  attentionHints?: string[];
+}
+
+interface MotorCommand {
+  commandType: "move" | "speak" | "gesture" | "act";
+  actorId: string;
+  move?: { target?: { position?: { x: number; y: number; z: number }; targetActorId?: string; area?: string }; speed?: string };
+  speak?: { content?: string; volume?: string; targetActorId?: string };
+  gesture?: { type?: string; targetActorId?: string };
+  act?: { action?: string; parameters?: Record<string, unknown>; rationale?: string };
+}
+
+interface ReasoningRequestBody {
+  actorId: string;
+  perceptionFrame?: PerceptionFrame;
+  input?: string;
+  mode?: "ask" | "plan" | "reflect" | "react";
   requestId?: string;
-  actorContext?: ActorContext;
-  [k: string]: unknown;
+  actorContext?: {
+    actorId?: string;
+    actorType?: string;
+    displayName?: string;
+    activeGoals?: string[];
+    sessionId?: string;
+    metadata?: {
+      memories?: Array<{ content?: { text?: string }; memory_type?: string }>;
+      world?: Record<string, unknown>;
+    };
+  };
+  availableCapabilities?: Array<{ action: string; sensitivityLevel: string; description: string }>;
 }
 
-interface Intent {
-  intentId: string;
-  actorId: string;
-  action: string;
-  parameters?: Record<string, unknown>;
-  sensitiveAction?: boolean;
-  rationale?: string;
-  confidence?: number;
-}
+// ── Perception to prompt ─────────────────────────────────────────────────────
 
-// ── Sensitive keyword detection (matches stub provider behaviour) ─────────────
+function perceptionToPrompt(frame: PerceptionFrame, directInput?: string): string {
+  const parts: string[] = [];
 
-const SENSITIVE_PATTERNS: Array<{ pattern: RegExp; action: string; rationale: string }> = [
-  {
-    pattern: /\b(delete|remove|clear|wipe)\b.*(wishlist|list|cart|saved)/i,
-    action: "wishlist.items.delete",
-    rationale: "User requested deletion of wishlist — irreversible action requiring approval.",
-  },
-  {
-    pattern: /\b(buy|purchase|order|checkout)\b/i,
-    action: "finance.purchase",
-    rationale: "User requested a purchase — financial action requiring approval.",
-  },
-  {
-    pattern: /\b(transfer|send)\b.*(money|funds|\$|£|€|\d+\s*(usd|eur|gbp))/i,
-    action: "finance.transfer",
-    rationale: "User requested a financial transfer — requires approval.",
-  },
-  {
-    pattern: /\b(cancel|unsubscribe)\b.*(subscription|plan|membership)/i,
-    action: "subscription.cancel",
-    rationale: "User requested subscription cancellation — irreversible action requiring approval.",
-  },
-];
+  if (frame.selfState) {
+    const s = frame.selfState;
+    const lines: string[] = [];
+    if (s.status) lines.push(`Status: ${s.status}`);
+    if (s.faculties?.length) lines.push(`Faculties: ${s.faculties.join(", ")}`);
+    if (s.currentGoals?.length) lines.push(`Goals:\n${s.currentGoals.map(g => `  - ${g}`).join("\n")}`);
+    if (lines.length > 0) parts.push(`## Your State\n${lines.join("\n")}`);
+  }
 
-function detectSensitiveIntent(actorId: string, input: string): Intent | null {
-  for (const { pattern, action, rationale } of SENSITIVE_PATTERNS) {
-    if (pattern.test(input)) {
-      return {
-        intentId: crypto.randomUUID(),
-        actorId,
-        action,
-        sensitiveAction: true,
-        rationale,
-        confidence: 0.75,
-      };
+  if (frame.attentionHints?.length) {
+    parts.push(`## Attention\n${frame.attentionHints.map(h => `- ${h}`).join("\n")}`);
+  }
+
+  if (frame.slices.length > 0) {
+    parts.push(`## Sensory Input (${frame.slices.length} slices)`);
+    for (const slice of frame.slices) {
+      const time = new Date(slice.capturedAt).toLocaleTimeString();
+      const channelDescs: string[] = [];
+      for (const ch of slice.channels) {
+        try {
+          const data = ch.payload.format === "json" ? JSON.parse(ch.payload.data) : ch.payload.data;
+          channelDescs.push(`[${ch.modality}] ${typeof data === "object" ? JSON.stringify(data) : data}`);
+        } catch {
+          channelDescs.push(`[${ch.modality}] (data)`);
+        }
+      }
+      if (channelDescs.length > 0) parts.push(`### ${time}\n${channelDescs.join("\n")}`);
     }
   }
-  return null;
-}
 
-// ── System prompt construction ────────────────────────────────────────────────
-
-const BASE_PROMPTS: Record<string, string> = {
-  ask:     "You are a helpful assistant. Answer the user's question clearly and concisely.",
-  plan:    "You are a planning assistant. Break the user's goal into a clear, ordered set of steps. Think step by step.",
-  reflect: "You are a reflective assistant. Review the user's input and provide thoughtful observations, identifying strengths, risks, and improvements.",
-};
-
-function buildSystemPrompt(request: ReasoningRequest): string {
-  const base = BASE_PROMPTS[request.mode ?? "ask"] ?? BASE_PROMPTS.ask;
-  const ctx = request.actorContext;
-  const parts: string[] = [base];
-
-  if (!ctx) return base;
-
-  if (ctx.displayName) {
-    parts.push(`You are speaking with ${ctx.displayName}.`);
-  }
-  if (ctx.actorType) {
-    parts.push(`Actor type: ${ctx.actorType}.`);
-  }
-  if (ctx.activeGoals && ctx.activeGoals.length > 0) {
-    parts.push(`Actor's active goals:\n${ctx.activeGoals.map((g) => `- ${g}`).join("\n")}`);
+  if (frame.memoryContext?.length) {
+    const memLines = frame.memoryContext.map((m: unknown) => {
+      const mem = m as Record<string, unknown>;
+      const content = mem.content as Record<string, unknown> | undefined;
+      return `- ${content?.text ?? JSON.stringify(content ?? mem)}`;
+    });
+    parts.push(`## Memories\n${memLines.join("\n")}`);
   }
 
-  const meta = ctx.metadata;
-  if (meta) {
-    // Inject memories
-    const memories = meta.memories;
-    if (Array.isArray(memories) && memories.length > 0) {
-      const memLines = memories
-        .map((m) => {
-          const text = m.content?.text ?? JSON.stringify(m.content ?? m);
-          return `- [${m.memory_type ?? "memory"}] ${text}`;
-        })
-        .join("\n");
-      parts.push(`Actor's recent memories:\n${memLines}`);
-    }
-
-    // Inject world facts
-    const world = meta.world;
-    if (world && typeof world === "object" && Object.keys(world).length > 0) {
-      const factLines = Object.entries(world)
-        .map(([k, v]) => `  ${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`)
-        .join("\n");
-      parts.push(`Current world context:\n${factLines}`);
-    }
+  if (directInput) {
+    parts.push(`## Direct Input\nThe user says: "${directInput}"`);
   }
 
   return parts.join("\n\n");
 }
 
-// ── Routes ────────────────────────────────────────────────────────────────────
+// ── System prompt ────────────────────────────────────────────────────────────
+
+const BASE_SYSTEM_PROMPT =
+  "You are an embodied agent in a 3D virtual world. You perceive the world through " +
+  "time-sliced sensory data and can act through motor commands.\n\n" +
+  "When you want to act, describe your intended actions in your response using " +
+  "this exact format (one per line):\n" +
+  "  [MOVE] area=commons\n" +
+  "  [SPEAK] content=Hello there! volume=normal\n" +
+  "  [GESTURE] type=wave\n" +
+  "  [ACT] action=calendar.event.create parameters={\"title\":\"Meeting\"} rationale=User requested a meeting\n\n" +
+  "Always provide natural language text alongside any action commands.\n\n";
+
+const MODE_PROMPTS: Record<string, string> = {
+  ask: "The user is asking a direct question. Answer concisely.",
+  plan: "Produce a step-by-step action plan.",
+  reflect: "Reflect on the situation with observations and recommendations.",
+  react: "React autonomously to your sensory input. If nothing interesting, observe briefly.",
+};
+
+function buildSystemPrompt(body: ReasoningRequestBody): string {
+  const mode = body.mode ?? "ask";
+  let prompt = BASE_SYSTEM_PROMPT + (MODE_PROMPTS[mode] ?? MODE_PROMPTS.ask);
+
+  const ctx = body.actorContext;
+  if (ctx?.displayName) prompt += `\n\nYou are speaking with ${ctx.displayName}.`;
+  if (ctx?.activeGoals?.length) prompt += `\n\nGoals:\n${ctx.activeGoals.map(g => `- ${g}`).join("\n")}`;
+
+  if (ctx?.metadata?.memories?.length) {
+    const memLines = ctx.metadata.memories.map(m => `- [${m.memory_type ?? "memory"}] ${m.content?.text ?? JSON.stringify(m.content)}`);
+    prompt += `\n\nMemories:\n${memLines.join("\n")}`;
+  }
+
+  if (body.availableCapabilities?.length) {
+    const capLines = body.availableCapabilities.map(c => `- ${c.action} [${c.sensitivityLevel}]: ${c.description}`);
+    prompt += `\n\nAvailable actions:\n${capLines.join("\n")}`;
+  }
+
+  return prompt;
+}
+
+// ── Parse motor commands from text ───────────────────────────────────────────
+
+function parseMotorCommands(text: string, actorId: string): { commands: MotorCommand[]; cleanText: string } {
+  const commands: MotorCommand[] = [];
+  const lines = text.split("\n");
+  const cleanLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    const moveMatch = trimmed.match(/^\[MOVE\]\s*(.*)/i);
+    if (moveMatch) {
+      const params = parseParams(moveMatch[1]);
+      commands.push({
+        commandType: "move",
+        actorId,
+        move: {
+          target: {
+            ...(params.area ? { area: params.area } : {}),
+            ...(params.targetActorId ? { targetActorId: params.targetActorId } : {}),
+          },
+          speed: params.speed ?? "walk",
+        },
+      });
+      continue;
+    }
+
+    const speakMatch = trimmed.match(/^\[SPEAK\]\s*(.*)/i);
+    if (speakMatch) {
+      const params = parseParams(speakMatch[1]);
+      commands.push({
+        commandType: "speak",
+        actorId,
+        speak: {
+          content: params.content ?? "",
+          volume: params.volume ?? "normal",
+          ...(params.targetActorId ? { targetActorId: params.targetActorId } : {}),
+        },
+      });
+      continue;
+    }
+
+    const gestureMatch = trimmed.match(/^\[GESTURE\]\s*(.*)/i);
+    if (gestureMatch) {
+      const params = parseParams(gestureMatch[1]);
+      commands.push({
+        commandType: "gesture",
+        actorId,
+        gesture: { type: params.type ?? "idle" },
+      });
+      continue;
+    }
+
+    const actMatch = trimmed.match(/^\[ACT\]\s*(.*)/i);
+    if (actMatch) {
+      const params = parseParams(actMatch[1]);
+      let parsedParams: Record<string, unknown> = {};
+      if (params.parameters) {
+        try { parsedParams = JSON.parse(params.parameters); } catch { /* ignore */ }
+      }
+      commands.push({
+        commandType: "act",
+        actorId,
+        act: {
+          action: params.action ?? "",
+          parameters: parsedParams,
+          rationale: params.rationale ?? "",
+        },
+      });
+      continue;
+    }
+
+    cleanLines.push(line);
+  }
+
+  return { commands, cleanText: cleanLines.join("\n").trim() };
+}
+
+function parseParams(paramStr: string): Record<string, string> {
+  const params: Record<string, string> = {};
+  // Match key=value pairs, where value can be a JSON object {...} or unquoted string
+  const regex = /(\w+)=(\{[^}]*\}|[^\s]+)/g;
+  let match;
+  while ((match = regex.exec(paramStr)) !== null) {
+    params[match[1]] = match[2];
+  }
+  return params;
+}
+
+// ── Routes ───────────────────────────────────────────────────────────────────
 
 app.get("/health", async (_request, reply) => {
-  return reply.send({ ok: true, service: "reference-provider-langchain", model: OPENAI_MODEL });
+  return reply.send({ ok: true, service: "reference-provider-langchain", model: OPENAI_MODEL, interactionPattern: "request-response" });
 });
 
-app.post<{ Body: ReasoningRequest }>("/reasoning", async (request, reply) => {
+app.post<{ Body: ReasoningRequestBody }>("/reasoning", async (request, reply) => {
   const body = request.body;
 
-  if (!body.actorId || typeof body.actorId !== "string") {
+  if (!body.actorId) {
     return reply.status(400).send({ error: "actorId is required" });
   }
-  if (!body.input || typeof body.input !== "string") {
-    return reply.status(400).send({ error: "input is required" });
+  if (!body.input && !body.perceptionFrame) {
+    return reply.status(400).send({ error: "input or perceptionFrame is required" });
+  }
+
+  // Build user message from perception frame and/or direct input
+  let userMessage: string;
+  if (body.perceptionFrame) {
+    userMessage = perceptionToPrompt(body.perceptionFrame, body.input);
+  } else {
+    userMessage = body.input!;
   }
 
   const systemPrompt = buildSystemPrompt(body);
 
-  const model = new ChatOpenAI({
-    model: OPENAI_MODEL,
-    temperature: 0.7,
-  });
+  const model = new ChatOpenAI({ model: OPENAI_MODEL, temperature: 0.7 });
 
   const start = Date.now();
   try {
     const response = await model.invoke([
       new SystemMessage(systemPrompt),
-      new HumanMessage(body.input),
+      new HumanMessage(userMessage),
     ]);
 
-    const text = typeof response.content === "string"
+    const rawText = typeof response.content === "string"
       ? response.content
       : JSON.stringify(response.content);
 
     const durationMs = Date.now() - start;
 
-    // Detect sensitive intent proposals
-    const sensitiveIntent = detectSensitiveIntent(body.actorId, body.input);
-    const proposedIntents: Intent[] = sensitiveIntent ? [sensitiveIntent] : [];
+    // Parse motor commands from text output
+    const { commands, cleanText } = parseMotorCommands(rawText, body.actorId);
 
     return reply.send({
-      text,
+      text: cleanText,
       requestId: body.requestId,
-      ...(proposedIntents.length > 0 ? { proposedIntents } : {}),
+      ...(commands.length > 0 ? { motorCommands: commands } : {}),
       providerMetadata: {
         provider: "langchain",
         model: OPENAI_MODEL,
         mode: body.mode ?? "ask",
         durationMs,
+        motorCommandCount: commands.length,
         ...(body.actorContext?.sessionId ? { sessionId: body.actorContext.sessionId } : {}),
       },
     });
@@ -230,7 +337,7 @@ app.post<{ Body: ReasoningRequest }>("/reasoning", async (request, reply) => {
   }
 });
 
-// ── Boot ──────────────────────────────────────────────────────────────────────
+// ── Boot ─────────────────────────────────────────────────────────────────────
 
 async function main() {
   try {
